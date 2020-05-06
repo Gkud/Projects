@@ -1,0 +1,220 @@
+---
+title: "Clinical_NLP"
+author: "Gayatri Kudchadker"
+date: "3/28/2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Import libraries
+```{r}
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(bigrquery)
+```
+
+Read the dataset
+```{r}
+con <- DBI::dbConnect(drv = bigquery(), project = "learnclinicaldatascience")
+dnotes <- tbl(con, "course4_data.diabetes_notes") %>% collect()
+head(dnotes)
+```
+
+Steps:
+1. Detect all notes with the term "diabetes". Remove false positives
+2. Search text with diabetes for direct presence of complications
+3. Search Leftover texts after step 2 for symptoms related to complications
+
+We want to find if the patient has diabetes thus we will remove sections like Family History, Allergies which do not tell us directly about the patient
+```{r}
+diabetic <- dnotes %>% mutate(TEXT_WITH_DIABETES = case_when(str_detect(TEXT, regex("FAMILY\\s*HISTORY", ignore_case = TRUE)) ~ str_replace(TEXT, regex("FAMILY\\s*HISTORY.*\n\n", ignore_case = TRUE, dotall = TRUE), replacement = ""), str_detect(TEXT, regex("ALLERGIES", ignore_case = TRUE)) ~ str_replace(TEXT, regex("ALLERGIES.*\n\n", ignore_case = TRUE, dotall = TRUE), replacement = ""), TRUE ~ TEXT)) 
+```
+
+Filter dataset with notes having the term diabetes or diabetic
+```{r}
+with_diab <- diabetic %>% filter(str_detect(string = TEXT_WITH_DIABETES, pattern = regex("diabet(es)?(ic)?" , ignore_case = TRUE))) 
+```
+
+Also extract texts without the word diabetes to analyze later 
+```{r}
+without_diab <- diabetic %>% filter(!(NOTE_ID %in% with_diab[["NOTE_ID"]]))
+```
+
+There are some text which contain the word "diabetes" but are associated with negative context like 'no history of diabetes". We will remove such text and add to the without_diab data table
+```{r}
+keyword <- "(?<![a-zA-Z])((no diabetes)|(is not diabetic)|(negative for diabetes)|(no history of diabetes)|(except (for)? diabetes))(?![a-zA-z])"
+neg_diab <- with_diab %>% filter(str_detect(TEXT_WITH_DIABETES, regex(keyword, ignore_case=TRUE)))
+with_diab <- with_diab %>% filter(!str_detect(TEXT_WITH_DIABETES, regex(keyword, ignore_case=TRUE)))
+without_diab <- rbind(without_diab, neg_diab)
+```
+
+88 transcriptions have the term diabetes in the text.
+Distribution of Note Types
+```{r}
+ggplot(with_diab, aes(NOTE_TYPE)) + geom_bar() + labs(title = "Distribution of Note Types", x = "Note Types", y = "Frequency") + theme(axis.text.x = element_text(angle = -45))
+```
+
+Remove unwanted tables to free space
+```{r}
+rm(dnotes)
+rm(diabetic)
+rm(neg_diab)
+```
+
+For text with word diabetes, let us now find any direct mention of words "Neuropathy", "Nephropathy",  "Retinopathy". We will also extract a window around this such words to analyze the text further.
+```{r}
+with_diab <- with_diab %>% 
+         mutate(DIABETES_TYPE = case_when(str_detect(TEXT_WITH_DIABETES, regex("Neuropath(y)?(ic)?", ignore_case=TRUE)) ~ "Neuropathy",
+                                        str_detect(TEXT_WITH_DIABETES, regex("Nephropath(y)?(ic)?", ignore_case=TRUE)) ~ "Nephropathy",
+                                        str_detect(TEXT_WITH_DIABETES, regex("Retinopath(y)?(ic)?", ignore_case=TRUE)) ~ "Retinopathy",
+                                        TRUE ~ ""))
+```
+
+We will separate text where diabetic type was found and the ones where it was not
+```{r}
+with_type <- with_diab %>% filter(DIABETES_TYPE != "")
+head(with_type)
+without_type <- with_diab %>% filter(DIABETES_TYPE == "")
+head(without_type)
+```
+
+Let us create a function to extract a text window
+dataframe :- diabetic dataset
+keyword :- word surrounding which the text should be extracted
+half_window_size :- length of the text to be extracted from both ends of the word
+```{r}
+extract_text_window <- function(dataframe, keyword, half_window_size) {
+  dataframe %>% 
+  group_by(NOTE_ID) %>% 
+  mutate(WORDS = TEXT_WITH_DIABETES) %>% 
+  separate_rows(WORDS, sep = "[ \\n]+") %>% 
+  mutate(INDEX = seq(from = 1, to = n(), by = 1.0),
+      WINDOW_START = case_when(INDEX - half_window_size < 1 ~ 1, TRUE ~ INDEX - half_window_size),
+      WINDOW_END = case_when(INDEX + half_window_size > max(INDEX) ~ max(INDEX), TRUE ~ INDEX + half_window_size), 
+      WINDOW = word(string = TEXT_WITH_DIABETES, start = WINDOW_START, end = WINDOW_END, sep = "[ \\n]+")) %>% 
+  ungroup() %>% 
+  filter(str_detect(string = WORDS, pattern = regex(keyword, ignore_case = TRUE)))
+}
+```
+
+Let us first extract the winow around the diabetic types
+```{r}
+keyword <- "(Neuropathy)|(Nephropathy)|(Retinopathy)"
+with_type <- extract_text_window(with_type, keyword, 10)
+head(with_type)
+```
+
+After examining the context words, we see that NOTE_ID 136 says there is no evidence of diabetic Retinopathy. So we remove that note.
+```{r}
+with_type <- with_type %>% filter(NOTE_ID != 136) %>% select(-c(WORDS, INDEX, WINDOW_START, WINDOW_END, INDEX, WINDOW, TEXT)) %>% distinct()
+
+without_type <- without_type %>% select(-c(DIABETES_TYPE, TEXT))
+```
+
+Let us find symptoms in the text
+```{r}
+keyword <- "((optic )?nerve(s)? damage)|(damage(d)? nerve(s)?)|(renal disease)|(kidney disease)|(renal failure)|(kidney failure)|(chronic renal)|(chronic kidney)|(retinal damage)|(blindness)"
+without_type <- without_type %>% mutate(SYMPTOMS = str_extract_all(TEXT_WITH_DIABETES, regex(keyword, ignore_case=TRUE)))
+
+keys1 <- c("nerve damage")
+keys2 <- c("kidney disease", "renal disease", "renal failure", "kidney failure", "chronic renal", "chronic kidney")
+keys3 <- c("retinal damage", "blindness", "optic nerve damage")
+
+types <- c()
+for (i in 1:nrow(without_type)){
+  sym <- without_type[[i, "SYMPTOMS"]]
+  if(length(sym) > 0){
+    if(all(tolower(unique(sym)) %in% keys1)){
+      types <- c(types, "Neuropathy")
+    }
+    else if(all(tolower(unique(sym)) %in% keys2)){
+      types <- c(types, "Nephropathy")
+    }
+    else if(all(tolower(unique(sym)) %in% keys3)){
+      types <- c(types, "Retinopathy")
+    }
+    else{
+      types <- c(types, "")
+    }
+  }
+  else{
+      types <- c(types, "")
+    }
+}
+
+without_type$DIABETES_TYPE <- types
+head(without_type)
+```
+
+Filter out the rows where symptoms have been found.
+Combine it with with_type table
+```{r}
+sym_df <- without_type %>% filter(DIABETES_TYPE != "") %>% select(-c(SYMPTOMS))
+final_df <- rbind(with_type, sym_df)
+final_df <- final_df %>% distinct()
+head(final_df)
+
+rm(sym_df)
+rm(with_type)
+```
+
+# Results
+Now let us compare the accuracy of the results with the gold standard data
+```{r}
+gold <- tbl(con, "course4_data.diabetes_goldstandard") %>% collect()
+head(gold)
+
+true_y <- gold %>% filter(ANY_DIABETIC_COMPLICATION == 1) %>% select(NOTE_ID) %>% unlist() 
+predicted_y <- final_df %>% select(NOTE_ID) %>% unlist()
+sprintf("Number of Actual Diabetic Texts: %i", length(true_y))
+sprintf("Number of Predicted Diabetic Texts: %i", length(predicted_y))
+sprintf("Total Correctly Classified Diabetic Texts: %i", sum(true_y %in% predicted_y))
+print("Incorrectly Identified Texts:")
+predicted_y[!(predicted_y %in% true_y)]
+print("Missed Texts:")
+true_y[!(true_y %in% predicted_y)]
+```
+
+# Neuropathy
+```{r}
+true_neu <- gold %>% filter(DIABETIC_NEUROPATHY == 1) %>% select(NOTE_ID) %>% unlist()
+predicted_neu <- final_df %>% filter(DIABETES_TYPE == "Neuropathy") %>% select(NOTE_ID) %>% unlist()
+sprintf("Number of Actual Diabetic Texts: %i", length(true_neu))
+sprintf("Number of Predicted Diabetic Texts: %i", length(predicted_neu))
+sprintf("Total Correctly Classified Neuropathy Texts: %i", sum(true_neu %in% predicted_neu))
+print("Incorrectly Identified Texts:")
+predicted_neu[!(predicted_neu %in% true_neu)]
+print("Missed Texts:")
+true_neu[!(true_neu %in% predicted_neu)]
+```
+
+# Nephropathy
+```{r}
+true_neph <- gold %>% filter(DIABETIC_NEPHROPATHY == 1) %>% select(NOTE_ID) %>% unlist()
+predicted_neph <- final_df %>% filter(DIABETES_TYPE == "Nephropathy") %>% select(NOTE_ID) %>% unlist()
+sprintf("Number of Actual Nephropathy Texts: %i", length(true_neph))
+sprintf("Number of Predicted Nephropathy Texts: %i", length(predicted_neph))
+sprintf("Total Correctly Classified Nephropathy Texts: %i", sum(true_neph %in% predicted_neph))
+print("Incorrectly Identified Texts:")
+predicted_neph[!(predicted_neph %in% true_neph)]
+print("Missed Texts:")
+true_neph[!(true_neu %in% predicted_neph)]
+```
+
+# Retinopathy
+```{r}
+true_ret <- gold %>% filter(DIABETIC_RETINOPATHY == 1) %>% select(NOTE_ID) %>% unlist()
+predicted_ret <- final_df %>% filter(DIABETES_TYPE == "Retinopathy") %>% select(NOTE_ID) %>% unlist()
+sprintf("Number of Actual Retinopathy Texts: %i", length(true_ret))
+sprintf("Number of Predicted Retinopathy Texts: %i", length(predicted_ret))
+sprintf("Total Correctly Classified Retinopathy Texts: %i", sum(true_ret %in% predicted_ret))
+print("Incorrectly Identified Texts:")
+predicted_ret[!(predicted_ret %in% true_ret)]
+print("Missed Texts:")
+true_ret[!(true_ret %in% predicted_ret)]
+```
+
