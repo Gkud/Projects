@@ -18,3 +18,4 @@
 6. Text Normalization Challenge - Kaggle
 7. Identifying Complex Words
 8. Analysis of Big Five Personality dataset
+9. Detect Racism on Twitter
