@@ -1,1 +1,1 @@
-
+The notebook implements machine learning techniques using scikit-learn to predict IMDB review sentiments. It extracts text features using BOW, TF-IDF, Word2vec and Doc2vec and compares accuracy using Naive-Bayes, Logistic Regression, KNN, Decision Tree.
